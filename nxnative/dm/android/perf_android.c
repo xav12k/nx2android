@@ -130,6 +130,40 @@ static uint64_t task_ticks(int tid) {
     for (char *t = c + 1; *t && field < 15; t++) if (*t == ' ') { field++; if (field == 14) ut = strtoull(t + 1, NULL, 10); else if (field == 15) st = strtoull(t + 1, NULL, 10); }
     return ut + st;
 }
+// DM_PIN_BUSY (default on; 0 turns it off): with no ADPF session (the system refused it, as Xiaomi HyperOS does on a Poco F5), nothing asks the scheduler to keep
+// the frame threads fast, and the scan above found them on the efficiency cores (WWE 2K18 on a Poco F5, Snapdragon 7+ Gen 2: a game thread and the vk record
+// thread on cpu3 at 1.8 GHz while the A710s ran other work). So the threads the scan picks (the presenting one + up to 5 using 15% of a core or more) are kept
+// off the cores of the lowest maximum clock; a thread that leaves the pick gets every core back. Only with no session: ADPF does this job where it works
+static int big_cores(cpu_set_t *set) {
+    static int done, ok; static cpu_set_t big;
+    if (!done) {
+        done = 1; long n = sysconf(_SC_NPROCESSORS_CONF); if (n > 32) n = 32; long mhz[32] = {0}, hi = 0, lo = 0;
+        for (long c = 0; c < n; c++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c); FILE *f = fopen(p, "r");
+            if (f) { if (fscanf(f, "%ld", &mhz[c]) != 1) mhz[c] = 0; fclose(f); } if (mhz[c] > hi) hi = mhz[c]; if (mhz[c] && (!lo || mhz[c] < lo)) lo = mhz[c]; }
+        CPU_ZERO(&big); char l[96]; size_t o = 0;
+        if (hi && hi != lo) for (long c = 0; c < n; c++) if (mhz[c] > lo) { CPU_SET(c, &big); o += snprintf(l + o, sizeof l - o, " %ld", c); }
+        ok = CPU_COUNT(&big) > 0;
+        if (ok) LOG("[perf] DM_PIN_BUSY: no ADPF session, busy frame threads kept on CPUs%s (above %ld MHz)", l, lo / 1000);
+        else LOG("[perf] DM_PIN_BUSY: the cores' clocks are unknown or all alike, threads left to the scheduler");
+    }
+    if (ok) *set = big;
+    return ok;
+}
+static void busy_threads_pin(const int32_t *pick, int npick) {
+    static int32_t pinned[8]; static int npinned, off = -1;
+    if (off < 0) { const char *e = getenv("DM_PIN_BUSY"); off = e && !strcmp(e, "0"); }
+    cpu_set_t big; if (off || !big_cores(&big)) return;
+    for (int i = 0; i < npinned; i++) {   // threads no longer busy: every core again (a thread that ended just fails)
+        int still = 0; for (int j = 0; j < npick; j++) still |= pick[j] == pinned[i]; if (still) continue;
+        cpu_set_t all; CPU_ZERO(&all); long n = sysconf(_SC_NPROCESSORS_CONF); if (n > 32) n = 32; for (long c = 0; c < n; c++) CPU_SET(c, &all);
+        sched_setaffinity(pinned[i], sizeof all, &all);
+    }
+    int ok = 0; char l[160]; size_t o = 0;
+    for (int i = 0; i < npick && i < 8; i++) if (!sched_setaffinity(pick[i], sizeof big, &big)) { pinned[ok++] = pick[i]; o += snprintf(l + o, sizeof l - o, " %d", pick[i]); }
+    int same = ok == npinned; for (int i = 0; same && i < ok; i++) { int in = 0; for (int j = 0; j < npinned; j++) in |= pinned[i] == pinned[j]; same = in; }
+    npinned = ok;
+    static int nlog; if (!same && nlog++ < 20) LOG("[perf] DM_PIN_BUSY: threads on the big cores:%s", ok ? l : " none (refused)");
+}
 static void hint_threads_scan(int32_t self) {
     static struct { int tid; uint64_t ticks; } prev[512]; static int np; static int64_t last;
     int64_t now = perf_now(); double secs = last ? (now - last) / 1e9 : 0; last = now;
@@ -154,6 +188,7 @@ static void hint_threads_scan(int32_t self) {
         }
     }
     np = 0; for (int i = 0; i < nc; i++) { prev[np].tid = cur[i].tid; prev[np].ticks = cur[i].used; np++; }
+    if (!g_hint) busy_threads_pin(pick, npick);
     if (!g_hint || !H.set_threads) return;
     int same = npick == g_hint_n; for (int i = 0; same && i < npick; i++) { int in = 0; for (int j = 0; j < g_hint_n; j++) in |= g_hint_tids[j] == pick[i]; same = in; }
     if (same) return;
