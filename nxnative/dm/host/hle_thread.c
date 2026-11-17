@@ -204,7 +204,7 @@ static void wake(thr_t *t, int64_t res) {
     if (self && self != t && !t->host_owned && t->prio < self->prio && t->mask == 1ull << (self->core & 63)) self->yield_pending = 1;
 }
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
-static int64_t block(thr_t *t, int kind, int64_t ns) {
+static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     struct timespec dl;
@@ -238,6 +238,26 @@ static int64_t block(thr_t *t, int kind, int64_t ns) {
     return t->wres;
 }
 
+// Wait profile (diagnostic): one "[waitprof]" line per busiest wait site every 10 s
+typedef struct { uint32_t handle; int kind; uint64_t pc, n, ns, max; } wp_t;
+static wp_t g_wp[256]; static uint64_t g_wp_t0;
+static void wp_add(thr_t *t, int kind, uint64_t ns) {
+    uint64_t pc = t->svc_pc; unsigned h = (unsigned)(((pc >> 2) * 2654435761u) ^ (t->handle * 40503u) ^ (unsigned)kind) & 255, i;
+    for (i = 0; i < 256; i++, h = (h + 1) & 255) { wp_t *e = &g_wp[h];
+        if (!e->n) { e->handle = t->handle; e->kind = kind; e->pc = pc; }
+        if (e->handle == t->handle && e->kind == kind && e->pc == pc) { e->n++; e->ns += ns; if (ns > e->max) e->max = ns; break; } }
+    uint64_t now = now_ns(); if (!g_wp_t0) g_wp_t0 = now;
+    if (now - g_wp_t0 < 10000000000ull) return;
+    for (int k = 0; k < 10; k++) { int bi = -1; uint64_t bn = 0;
+        for (int j = 0; j < 256; j++) if (g_wp[j].ns > bn) { bn = g_wp[j].ns; bi = j; }
+        if (bi < 0) break; wp_t *e = &g_wp[bi]; module_t *m = module_of((void *)e->pc);
+        LOG("[waitprof] thread %#x kind %d %s+%#llx: %llu waits, %.1f ms blocked (%.0f us each, longest %.1f ms)", e->handle, e->kind, m ? m->name : "?", m ? (unsigned long long)(e->pc - (uint64_t)m->base) : (unsigned long long)e->pc,
+            (unsigned long long)e->n, e->ns / 1e6, e->ns / 1e3 / (double)e->n, e->max / 1e6); e->ns = 0; }
+    memset(g_wp, 0, sizeof g_wp); g_wp_t0 = now;
+}
+static int64_t block(thr_t *t, int kind, int64_t ns) {
+    uint64_t t0 = now_ns(); int64_t r = block_inner(t, kind, ns); if (ns != 0) wp_add(t, kind, now_ns() - t0); return r;
+}
 // ---------- Locks ----------
 static inline uint32_t ld32(uint64_t a) { return __atomic_load_n((uint32_t *)a, __ATOMIC_SEQ_CST); }
 static inline uint64_t ld64(uint64_t a) { return __atomic_load_n((uint64_t *)a, __ATOMIC_SEQ_CST); }

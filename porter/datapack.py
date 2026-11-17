@@ -23,7 +23,7 @@ ROMFS = 'RomFS'
 def link_or_copy(src, dst):
     dst.parent.mkdir(parents=True, exist_ok=True)
     try: os.link(src, dst)
-    except OSError: shutil.copy2(src, dst)
+    except (OSError, AttributeError): shutil.copy2(src, dst)
 
 
 def link_tree(src, dst):   # (files, bytes)

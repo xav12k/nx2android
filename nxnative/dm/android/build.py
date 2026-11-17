@@ -27,10 +27,15 @@ if not (a.exe or a.lib): a.exe = a.lib = True
 
 def host_dir(base, tool):
     """The NDK's host folder for a tool under base. On arm64 Linux the NDK ships x86_64 host tools only, so a folder named linux-aarch64 with an arm64 build of the tool beside the NDK's sysroot
-    (see docs/DEVELOPMENT_GUIDE.md) is used when it holds the tool; otherwise linux-x86_64, as before (an x86_64 machine, or arm64 with qemu-user / box64), so a missing folder fails as it did"""
+    (see docs/DEVELOPMENT_GUIDE.md) is used when it holds the tool; otherwise linux-x86_64, as before (an x86_64 machine, or arm64 with qemu-user / box64), so a missing folder fails as it did.
+    Termux (Python 3.13+ reports sys.platform 'android'): the NDK built for the phone itself, linux-aarch64, or whichever host folder holds the tool"""
     if os.name == 'nt': return 'windows-x86_64'
-    if not sys.platform.startswith('linux'): return 'darwin-x86_64'
-    if platform.machine() in ('aarch64', 'arm64') and (Path(a.ndk) / base / 'linux-aarch64' / tool).exists(): return 'linux-aarch64'
+    termux = sys.platform == 'android'
+    if not (termux or sys.platform.startswith('linux')): return 'darwin-x86_64'
+    if (termux or platform.machine() in ('aarch64', 'arm64')) and (Path(a.ndk) / base / 'linux-aarch64' / tool).exists(): return 'linux-aarch64'
+    if termux:
+        for d in sorted((Path(a.ndk) / base).glob('*')):
+            if (d / tool).exists(): return d.name
     return 'linux-x86_64'
 host = host_dir('toolchains/llvm/prebuilt', 'bin/clang')
 bin_ = Path(a.ndk) / 'toolchains/llvm/prebuilt' / host / 'bin'
