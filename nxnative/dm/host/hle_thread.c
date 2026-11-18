@@ -250,9 +250,9 @@ static void wp_add(thr_t *t, int kind, uint64_t ns) {
     uint64_t now = now_ns(); if (!g_wp_t0) g_wp_t0 = now;
     if (now - g_wp_t0 < 10000000000ull) return;
     for (int k = 0; k < 8; k++) { int bi = -1; uint64_t bn = 0;   // the main thread's own wait sites first: with the idle pool workers (each blocked the whole 10 s) in the table they never reach the top
-        for (int j = 0; j < 256; j++) if (g_wp[j].handle == g_main_handle && g_wp[j].ns > bn) { bn = g_wp[j].ns; bi = j; }
+        for (int j = 0; j < 256; j++) if (g_wp[j].ns < 9500000000ull && g_wp[j].ns > bn) { bn = g_wp[j].ns; bi = j; }   // a thread blocked under 9.5 of the 10 s is one that works: the idle pool workers (blocked all of it) are below
         if (bi < 0) break; wp_t *e = &g_wp[bi]; module_t *m = module_of((void *)e->pc), *ml = module_of((void *)e->lr);
-        LOG("[waitprof] MAIN kind %d %s+%#llx from %s+%#llx: %llu waits, %.1f ms blocked in 10 s (%.0f us each, longest %.1f ms)", e->kind, m ? m->name : "?", m ? (unsigned long long)(e->pc - (uint64_t)m->base) : (unsigned long long)e->pc,
+        LOG("[waitprof] ACTIVE thread %#x kind %d %s+%#llx from %s+%#llx: %llu waits, %.1f ms blocked in 10 s (%.0f us each, longest %.1f ms)", e->handle, e->kind, m ? m->name : "?", m ? (unsigned long long)(e->pc - (uint64_t)m->base) : (unsigned long long)e->pc,
             ml ? ml->name : "?", ml ? (unsigned long long)(e->lr - (uint64_t)ml->base) : (unsigned long long)e->lr, (unsigned long long)e->n, e->ns / 1e6, e->ns / 1e3 / (double)e->n, e->max / 1e6); e->ns = 0; }
     for (int k = 0; k < 10; k++) { int bi = -1; uint64_t bn = 0;
         for (int j = 0; j < 256; j++) if (g_wp[j].ns > bn) { bn = g_wp[j].ns; bi = j; }
