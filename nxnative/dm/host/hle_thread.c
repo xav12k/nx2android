@@ -239,15 +239,21 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
 }
 
 // Wait profile (diagnostic): one "[waitprof]" line per busiest wait site every 10 s
-typedef struct { uint32_t handle; int kind; uint64_t pc, n, ns, max; } wp_t;
-static wp_t g_wp[256]; static uint64_t g_wp_t0;
+typedef struct { uint32_t handle; int kind; uint64_t pc, lr, n, ns, max; } wp_t;
+static wp_t g_wp[256]; static uint64_t g_wp_t0; static uint32_t g_main_handle;   // g_main_handle: the guest main thread (svc_thread_main_init), whose waits get lines of their own
 static void wp_add(thr_t *t, int kind, uint64_t ns) {
-    uint64_t pc = t->svc_pc; unsigned h = (unsigned)(((pc >> 2) * 2654435761u) ^ (t->handle * 40503u) ^ (unsigned)kind) & 255, i;
+    uint64_t pc = t->svc_pc, lr = 0; uint64_t *rg = atomic_load(&t->svc_regs); if (rg) lr = rg[30];   // lr: the SDK wrapper's caller's side of the call, tells event / semaphore / mutex waits apart
+    unsigned h = (unsigned)(((pc >> 2) * 2654435761u) ^ ((lr >> 2) * 40503u) ^ (t->handle * 40503u) ^ (unsigned)kind) & 255, i;
     for (i = 0; i < 256; i++, h = (h + 1) & 255) { wp_t *e = &g_wp[h];
-        if (!e->n) { e->handle = t->handle; e->kind = kind; e->pc = pc; }
-        if (e->handle == t->handle && e->kind == kind && e->pc == pc) { e->n++; e->ns += ns; if (ns > e->max) e->max = ns; break; } }
+        if (!e->n) { e->handle = t->handle; e->kind = kind; e->pc = pc; e->lr = lr; }
+        if (e->handle == t->handle && e->kind == kind && e->pc == pc && e->lr == lr) { e->n++; e->ns += ns; if (ns > e->max) e->max = ns; break; } }
     uint64_t now = now_ns(); if (!g_wp_t0) g_wp_t0 = now;
     if (now - g_wp_t0 < 10000000000ull) return;
+    for (int k = 0; k < 8; k++) { int bi = -1; uint64_t bn = 0;   // the main thread's own wait sites first: with the idle pool workers (each blocked the whole 10 s) in the table they never reach the top
+        for (int j = 0; j < 256; j++) if (g_wp[j].handle == g_main_handle && g_wp[j].ns > bn) { bn = g_wp[j].ns; bi = j; }
+        if (bi < 0) break; wp_t *e = &g_wp[bi]; module_t *m = module_of((void *)e->pc), *ml = module_of((void *)e->lr);
+        LOG("[waitprof] MAIN kind %d %s+%#llx from %s+%#llx: %llu waits, %.1f ms blocked in 10 s (%.0f us each, longest %.1f ms)", e->kind, m ? m->name : "?", m ? (unsigned long long)(e->pc - (uint64_t)m->base) : (unsigned long long)e->pc,
+            ml ? ml->name : "?", ml ? (unsigned long long)(e->lr - (uint64_t)ml->base) : (unsigned long long)e->lr, (unsigned long long)e->n, e->ns / 1e6, e->ns / 1e3 / (double)e->n, e->max / 1e6); e->ns = 0; }
     for (int k = 0; k < 10; k++) { int bi = -1; uint64_t bn = 0;
         for (int j = 0; j < 256; j++) if (g_wp[j].ns > bn) { bn = g_wp[j].ns; bi = j; }
         if (bi < 0) break; wp_t *e = &g_wp[bi]; module_t *m = module_of((void *)e->pc);
@@ -414,7 +420,7 @@ uint32_t svc_thread_main_init(void) {
     pthread_cond_init(&t->cv, NULL); pthread_cond_init(&t->pcv, NULL);
     t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt); t->host_work = &dm_host_work;
     G_lock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
-    pthread_setspecific(g_keythr, t);
+    pthread_setspecific(g_keythr, t); g_main_handle = t->handle;
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
     return t->handle;
