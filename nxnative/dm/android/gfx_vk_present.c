@@ -819,6 +819,11 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
 // slack). The pause menu's redraws carry no time. DM_VK_PACE=0 (live) presents without times
 static uint64_t g_refresh_ns, g_pace_target, g_pace_ideal, g_pace_anchor, g_pace_n, g_pace_resync, g_pace_slip; static uint32_t g_pace_id; static int g_pace_on = 1;
 static uint64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+// Where the frame waits (diagnostic, no behaviour change): nanoseconds summed per kind, printed per frame every 600 presents ([stall] line).
+// 0 present thread: vkWaitForFences on its slot; 1 present thread: vkAcquireNextImageKHR; 2 present thread: queue lock + vkQueueSubmit + vkQueuePresentKHR;
+// 3 game thread: present_enqueue backlog (PQ_N frames behind); 4 game thread: mtl_present_wait (NVN acquire waits for the last blit); 5 game thread: dm_perf_frame (pacing)
+static _Atomic uint64_t g_stl[6];
+#define STL_ADD(k, t0) atomic_fetch_add(&g_stl[k], mono_ns() - (t0))
 static void pace_reset(void) { g_pace_target = g_pace_ideal = g_pace_anchor = g_refresh_ns = 0; }
 static uint64_t pace_snap(uint64_t t) {   // the first vsync at or after t on the grid through the anchor
     uint64_t r = g_refresh_ns, a = g_pace_anchor;
@@ -858,10 +863,10 @@ static uint64_t pace_desired(double period) {   // the frame's desired present t
 }
 static void present_window(vkimg_t *im, const int crop[4], double period, uint64_t ticket) {   // period: the game's frame period (s); < 0 for a redraw (ticket 0)
     uint32_t k = g_pi++ % 8;
-    vkWaitForFences(V.dev, 1, &g_pfence[k], 1, UINT64_MAX);
+    { uint64_t t0 = mono_ns(); vkWaitForFences(V.dev, 1, &g_pfence[k], 1, UINT64_MAX); STL_ADD(0, t0); }
     VkFormat want = im->fmt == VK_FORMAT_R8G8B8A8_SRGB || im->fmt == VK_FORMAT_B8G8R8A8_SRGB || im->fmt == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     if (want != g_want) { g_want = want; swap_destroy(); if (!swap_make()) return; }   // once, at the first present of the other kind
-    uint32_t idx; VkResult r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx);
+    uint32_t idx; uint64_t stl_t0 = mono_ns(); VkResult r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx); STL_ADD(1, stl_t0);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { swap_destroy(); if (!swap_make()) return; r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx); }
     if (r < 0) { VKRED_ONCE(90, "vkAcquireNextImageKHR: %d", r); return; }
     vkResetFences(V.dev, 1, &g_pfence[k]);
@@ -921,6 +926,7 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &g_acq[k], &ws, 1, &cb, 1, &g_done_sem[k]};
     extern pthread_mutex_t g_vk_queue_mu;
+    stl_t0 = mono_ns();
     pthread_mutex_lock(&g_vk_queue_mu);
     if (vkQueueSubmit(V.q, 1, &si, g_pfence[k])) { pthread_mutex_unlock(&g_vk_queue_mu); VKRED_ONCE(91, "present submit failed"); return; }
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &g_done_sem[k], 1, &g_swap, &idx, NULL};
@@ -929,7 +935,7 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     if (V.has_dtiming) pi.pNext = &pti;
     r = vkQueuePresentKHR(V.q, &pi);
     if (V.has_dtiming && r >= 0) present_time_map(ptm.presentID, ticket);
-    pthread_mutex_unlock(&g_vk_queue_mu);
+    pthread_mutex_unlock(&g_vk_queue_mu); STL_ADD(2, stl_t0);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) swap_destroy();
     else if (r == VK_SUBOPTIMAL_KHR && g_pre != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {   // the device turned over (ROTATE_90 <-> ROTATE_270): a swapchain for the new turn
         VkSurfaceCapabilitiesKHR c; vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.pd, g_surf, &c);
@@ -1008,7 +1014,7 @@ static uint64_t present_enqueue(vkimg_t *im, const int crop[4], uint64_t n, doub
     }
     pthread_once(&once, present_thread_start);
     pthread_mutex_lock(&g_pq_mu);
-    while (g_pq_head - g_pq_tail >= PQ_N) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // never more than PQ_N frames behind
+    { uint64_t t0 = mono_ns(); while (g_pq_head - g_pq_tail >= PQ_N) pthread_cond_wait(&g_pq_cv, &g_pq_mu); STL_ADD(3, t0); }   // never more than PQ_N frames behind
     typeof(g_pq[0]) *e = &g_pq[g_pq_head % PQ_N]; e->im = im; e->n = n; e->period = period; e->has_crop = crop != NULL; if (crop) memcpy(e->crop, crop, sizeof e->crop);
     g_pq_head++; pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
@@ -1020,7 +1026,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     { uint64_t vk_replay_ns(void); double vk_gpu_ms_recent(void);   // what else the frame costs: its replay and its GPU time
       static uint64_t last_exec; uint64_t ex = vk_replay_ns(), rp = ex - last_exec; last_exec = ex; double g = vk_gpu_ms_recent(); int64_t gn = g > 0 ? (int64_t)(g * 1e6) : 0;
       dm_perf_frame_cost((int64_t)rp, gn); }
-    dm_perf_frame(period);   // paced to the game's frame period, and its work time reported to ADPF
+    { uint64_t t0 = mono_ns(); dm_perf_frame(period); STL_ADD(5, t0); }   // paced to the game's frame period, and its work time reported to ADPF
     // A longer period goes to the window only once it has held for 60 presents; a shorter one at once. Super Mario Bros. Wonder's own controller (main+0xcfd24) asks
     // for interval 2 for a frame or a few and then 1 again: each ask was a vote (176 in 3 minutes of its first level on the Y700, 27-60 a run in issue #64's log of an
     // Adreno 750 phone with a 60 Hz display), and where the display changes its mode for a vote, the switch itself lengthens the next frames (issue #45: 30-40 fps)
@@ -1041,6 +1047,12 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     vkimg_t *im = vk_tex(t);
     static uint64_t no_img, undrawn, shown;
     if (n == 600) { void crash_handlers_check(const char *when); crash_handlers_check("after 600 presents"); }
+    if (n % 600 == 0) {
+        static uint64_t pst[6]; uint64_t cur[6]; for (int i = 0; i < 6; i++) cur[i] = atomic_load(&g_stl[i]);
+        VKLOG("[stall] per frame (last 600), ms: present thread waits: fence %.2f, acquire %.2f, queue lock+submit+present %.2f; game thread waits: present backlog %.2f, last-blit wait (NVN acquire) %.2f, pacing %.2f",
+              (cur[0] - pst[0]) / 6e8, (cur[1] - pst[1]) / 6e8, (cur[2] - pst[2]) / 6e8, (cur[3] - pst[3]) / 6e8, (cur[4] - pst[4]) / 6e8, (cur[5] - pst[5]) / 6e8);
+        for (int i = 0; i < 6; i++) pst[i] = cur[i];
+    }
     if (n % 600 == 0) {
         extern struct { uint64_t draws, skip_prog, skip_rt, skip_pipe, passes, folded, dispatches, pipes_built, rt_kept, ns_exec, ns_desc, ns_pipe, max_pass_draws; } g_vkst; extern uint64_t g_ubd_landed, g_ubd_superseded, g_ubd_shadows, g_ubd_bytes, g_ns_submit, g_gpu_ns, g_pkg_n, g_pkg_bytes, g_pkg_ns, g_set_hits, g_set_new, g_set_key_bypass, g_ubd_racy, g_ns_set_build, g_ns_set_hash, g_ns_set_new, g_set_memo, g_set_memo_bad;
         static uint64_t psb, psh, psn, pe, pd, pp, ps, pb, pdr, pg, pkn, pkb, pkt, psm;
@@ -1111,7 +1123,7 @@ void mtl_present_wait(uint64_t tk) {   // NVN acquire: the window texture's last
     if (!tk) return;
     pthread_mutex_lock(&g_pq_mu);
     struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += 1;
-    while (g_pq_done < tk && pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &dl) == 0) {}
+    { uint64_t t0 = mono_ns(); while (g_pq_done < tk && pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &dl) == 0) {} STL_ADD(4, t0); }
     pthread_mutex_unlock(&g_pq_mu);
 }
 double mtl_presented_time(uint64_t n) { return present_time_get(n); }
